@@ -28,17 +28,15 @@ chown -R root:root "$PREFIX"; chmod -R go-w "$PREFIX"
 
 install -d -m 0755 "/etc/$APP"
 install -m 0644 "$CONFIG" "/etc/$APP/config.json"
-OUT=$("$PREFIX/venv/bin/python" -c 'import json,sys;print(json.load(open(sys.argv[1]))["output_dir"])' "$CONFIG")
-# Wait for the recordings folder's disk (e.g. a NAS mount) before starting.
-MOUNTS=""
-case "$OUT" in /mnt/*|/media/*|/srv/*) MOUNTS="RequiresMountsFor=$OUT";; esac
+# No hard dependency on the recordings folder's disk (e.g. a NAS mount): at boot the
+# network may not be up yet, and systemd would then skip the service entirely.
+# The recorder records to local disk and retries the copy until the NAS is back.
 
 cat > "$UNIT" <<UNIT
 [Unit]
 Description=Elegoo print recorder (records the printer camera for every print)
 Wants=network-online.target
-After=network-online.target
-$MOUNTS
+After=network-online.target remote-fs.target tailscaled.service
 
 [Service]
 User=$RUN_AS
