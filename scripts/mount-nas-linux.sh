@@ -13,8 +13,7 @@ command -v mount.cifs >/dev/null || { echo "Installing cifs-utils..."; apt-get i
 install -d -m 0755 /etc/elegoo-print-recorder "$MNT"
 if [ ! -s "$CRED" ]; then
   read -r -s -p "Password for NAS user $NAS_USER: " PASS; echo
-  umask 077
-  printf 'username=%s\npassword=%s\n' "$NAS_USER" "$PASS" > "$CRED"
+  (umask 077; printf 'username=%s\npassword=%s\n' "$NAS_USER" "$PASS" > "$CRED")
   unset PASS
 fi
 chmod 600 "$CRED"
@@ -24,7 +23,7 @@ OPTS="credentials=$CRED,uid=$uid,gid=$gid,file_mode=0644,dir_mode=0755,vers=3.0,
 LINE="$SHARE $MNT cifs $OPTS 0 0"
 grep -v " $MNT cifs " /etc/fstab > /etc/fstab.new || true
 echo "$LINE" >> /etc/fstab.new
-mv /etc/fstab.new /etc/fstab
+chmod 644 /etc/fstab.new; mv /etc/fstab.new /etc/fstab
 systemctl daemon-reload
 systemctl restart "$(systemd-escape -p --suffix=automount "$MNT")" 2>/dev/null || true
 

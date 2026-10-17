@@ -65,7 +65,7 @@ def test_records_a_whole_print(setup):
     assert fake.video_calls() == [1]           # still recording during the stop delay
     assert wait_for(lambda: mp4s(out), 30)
     files = mp4s(out)
-    assert len(files) == 1 and "My Part" in files[0].name
+    assert len(files) == 1 and files[0].name.endswith("_My_Part.mp4")
     assert duration(files[0]) > 5
     assert fake.video_calls() == [1, 0]        # camera handed back
     assert fake.viewers == 0
@@ -219,7 +219,7 @@ def test_same_name_does_not_overwrite(tmp_path):
     src = tmp_path / "new"
     src.write_text("second")
     dest = core.move_into(src, a, None)
-    assert dest.name == "x (2).mp4" and a.read_text() == "first"
+    assert dest.name == "x_2.mp4" and a.read_text() == "first"
 
 
 @needs_ffmpeg

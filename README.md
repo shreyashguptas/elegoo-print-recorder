@@ -39,7 +39,7 @@ It runs as a systemd service: it starts at boot and restarts if it crashes. If t
 | When | What happens |
 |---|---|
 | A print starts | Recording starts at layer 3 |
-| The print ends | 2 minutes later it saves `2026-10-16 14.11 My Part.mp4` |
+| The print ends | 2 minutes later it saves `2026-10-16_14-11_My_Part.mp4` |
 | Your Mac restarts | It starts again by itself |
 
 ## Good to know

@@ -413,7 +413,7 @@ def print_state(status: Dict) -> Dict:
 
 def safe_name(text: str) -> str:
     text = re.sub(r"\.(goo|ctb|cbddlp|prz|jxs)$", "", text, flags=re.I)
-    text = re.sub(r"[^\w\-. ]+", "_", text).strip(" ._")
+    text = re.sub(r"[^\w\-.]+", "_", text).strip(" ._")
     return text[:80] or "print"
 
 
@@ -571,7 +571,7 @@ def unique_path(path: Path) -> Path:
     n = 2
     candidate = path
     while candidate.exists() or candidate.is_symlink():
-        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
         n += 1
     return candidate
 
@@ -628,7 +628,7 @@ def finalize(ffmpeg: str, parts: List[Path], out: Path, keep_ts: bool, cfg: Opti
         log.error("could not make %s (%s); saving the raw recording instead", out.name,
                   r.stderr.decode(errors="replace")[-300:].strip())
         for i, p in enumerate(parts, 1):
-            move_into(p, out.with_name(f"{out.stem} raw {i}.ts"), cfg)
+            move_into(p, out.with_name(f"{out.stem}_raw{i}.ts"), cfg)
         return None
     tmp.with_suffix(".done").touch()
     return _deliver(tmp, parts, out, keep_ts, cfg)
@@ -646,7 +646,7 @@ def _deliver(tmp: Path, parts: List[Path], out: Path, keep_ts: bool, cfg: Option
     log.info("saved %s (%.1f MB)", final, final.stat().st_size / 1e6)
     for i, p in enumerate(parts, 1):
         if keep_ts:
-            move_into(p, out.with_name(f"{out.stem} raw {i}.ts"), cfg)
+            move_into(p, out.with_name(f"{out.stem}_raw{i}.ts"), cfg)
         else:
             p.unlink(missing_ok=True)
         p.with_suffix(".log").unlink(missing_ok=True)
@@ -803,8 +803,8 @@ class Recorder:
 
     def begin(self, st: Dict) -> None:
         make_output_dir(self.cfg)
-        stamp = dt.datetime.now().strftime("%Y-%m-%d %H.%M")
-        self.base = self.out_dir / f"{stamp} {safe_name(st['filename'])}.mp4"
+        stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M")
+        self.base = self.out_dir / f"{stamp}_{safe_name(st['filename'])}.mp4"
         self.session = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + os.urandom(3).hex()
         self.task_id, self.parts, self.end_deadline = st["task_id"], [], None
         log.info("print started: %s (layer %s of %s)", st["filename"], st["layer"], st["total_layers"])
