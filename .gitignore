@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.setup-config.json
+dist/
+*.mp4
+*.ts
+*.mkv
