@@ -31,17 +31,26 @@ from typing import Dict, List, Optional, Tuple
 
 APP = "elegoo-print-recorder"
 VERSION = "0.1.0"
-# The background service runs as a system LaunchDaemon (macOS exempts those from
-# Local Network privacy, which silently blocks per-user agents), so its files
-# live in the system Library.
-SUPPORT_DIR = Path("/Library/Application Support") / APP
-LOG_DIR = Path("/Library/Logs") / APP
-DEFAULT_CONFIG = SUPPORT_DIR / "config.json"
+IS_MAC = sys.platform == "darwin"
+if IS_MAC:
+    # The macOS service is a system LaunchDaemon (macOS exempts those from Local
+    # Network privacy, which silently blocks per-user agents), so its files live
+    # in the system Library.
+    SUPPORT_DIR = Path("/Library/Application Support") / APP
+    LOG_DIR = Path("/Library/Logs") / APP
+    DEFAULT_CONFIG = SUPPORT_DIR / "config.json"
+    DEFAULT_OUTPUT = Path.home() / "Movies" / "Printer Recordings"
+else:
+    # Linux: a systemd service; systemd creates the state and log folders for it.
+    SUPPORT_DIR = Path(os.environ.get("STATE_DIRECTORY") or f"/var/lib/{APP}")
+    LOG_DIR = Path(os.environ.get("LOGS_DIRECTORY") or f"/var/log/{APP}")
+    DEFAULT_CONFIG = Path(f"/etc/{APP}/config.json")
+    DEFAULT_OUTPUT = Path.home() / "Printer Recordings"
 
 DEFAULTS = {
     "printer_ip": "",              # filled in by `setup` (printer discovery)
     "mainboard_id": "",            # lets us find the printer again if its IP changes
-    "output_dir": str(Path.home() / "Movies" / "Printer Recordings"),
+    "output_dir": str(DEFAULT_OUTPUT),
     "stop_delay_seconds": 120,     # keep recording this long after a print ends
     "start_at_layer": 3,           # see README: asking for video in layers 1-2 can wedge the camera
     "poll_seconds": 5,
@@ -124,7 +133,7 @@ def work_dir(cfg: Dict) -> Path:
     so nothing in the user's folders is written by root until a file is finished)."""
     if cfg.get("work_dir"):
         return Path(cfg["work_dir"])
-    if os.geteuid() == 0:
+    if os.access(SUPPORT_DIR, os.W_OK):  # the installed service
         return SUPPORT_DIR / "work"
     return Path(cfg["output_dir"]) / ".recording"
 
@@ -133,11 +142,12 @@ def find_ffmpeg(cfg: Dict) -> str:
     # Prefer stable paths (Homebrew's bin symlink) over versioned Cellar paths,
     # which disappear on `brew upgrade`.
     candidates = [cfg.get("ffmpeg") or "", "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
-                  shutil.which("ffmpeg") or ""]
+                  "/usr/bin/ffmpeg", shutil.which("ffmpeg") or ""]
     for c in candidates:
         if c and os.access(c, os.X_OK):
             return c
-    raise SystemExit("ffmpeg not found. Install it with: brew install ffmpeg")
+    raise SystemExit("ffmpeg not found. Install it with: "
+                     + ("brew install ffmpeg" if IS_MAC else "sudo apt install ffmpeg"))
 
 
 def setup_logging(verbose: bool, to_file: bool) -> None:
@@ -590,6 +600,8 @@ def finalize(ffmpeg: str, parts: List[Path], out: Path, keep_ts: bool, cfg: Opti
         return None
     work = parts[0].parent
     tmp = work / (parts[0].stem.split(".part")[0] + ".partial.mp4")
+    if tmp.exists() and tmp.stat().st_size > 0 and tmp.with_suffix(".done").exists():
+        return _deliver(tmp, parts, out, keep_ts, cfg)
     listfile = None
     if len(parts) == 1:
         src = ["-i", str(parts[0])]
@@ -618,7 +630,19 @@ def finalize(ffmpeg: str, parts: List[Path], out: Path, keep_ts: bool, cfg: Opti
         for i, p in enumerate(parts, 1):
             move_into(p, out.with_name(f"{out.stem} raw {i}.ts"), cfg)
         return None
-    final = move_into(tmp, out, cfg)
+    tmp.with_suffix(".done").touch()
+    return _deliver(tmp, parts, out, keep_ts, cfg)
+
+
+def _deliver(tmp: Path, parts: List[Path], out: Path, keep_ts: bool, cfg: Optional[Dict]) -> Path:
+    """Move the finished .mp4 into the recordings folder, then clean up."""
+    try:
+        make_output_dir(cfg) if cfg else out.parent.mkdir(parents=True, exist_ok=True)
+        final = move_into(tmp, out, cfg)
+    except OSError as e:  # e.g. the NAS is offline: keep it here and try again later
+        log.error("could not save %s to %s (%s); will try again", out.name, out.parent, e)
+        raise
+    tmp.with_suffix(".done").unlink(missing_ok=True)
     log.info("saved %s (%.1f MB)", final, final.stat().st_size / 1e6)
     for i, p in enumerate(parts, 1):
         if keep_ts:
@@ -663,6 +687,7 @@ class Recorder:
         self.last_full_warning = 0.0
         self.last_ok = time.monotonic()
         self.last_discovery = 0.0
+        self.retry_at: Optional[float] = None
         self.finalizers: List[threading.Thread] = []
 
     # ---- printer connection
@@ -770,10 +795,9 @@ class Recorder:
             self.segment = None
 
     def save_state(self) -> None:
-        try:
-            self.statefile.write_text(json.dumps({"base": str(self.base), "parts": [str(p) for p in self.parts]}))
-        except OSError as e:
-            log.debug("could not save state: %s", e)
+        items = [x for x in self.load_pending() if x.get("base") != str(self.base)]
+        items.append({"base": str(self.base), "parts": [str(p) for p in self.parts]})
+        self.save_pending(items)
 
     # ---- print sessions
 
@@ -801,18 +825,46 @@ class Recorder:
             try:
                 finalize(self.ffmpeg, parts, base, bool(self.cfg["keep_ts"]), self.cfg)
             except Exception:
-                log.exception("could not finish %s", base.name)
-            finally:
-                try:
-                    st = json.loads(self.statefile.read_text())
-                    if st.get("base") == str(base):
-                        self.statefile.unlink()
-                except (OSError, ValueError):
-                    pass
+                log.exception("could not finish %s; will retry in 10 minutes", base.name)
+                self.retry_at = time.monotonic() + 600
+                return  # keep the state file so nothing is forgotten
+            self.forget(base)
         self.finalizers = [t for t in self.finalizers if t.is_alive()]
         t = threading.Thread(target=job)
         t.start()
         self.finalizers.append(t)
+
+    def forget(self, base: Path) -> None:
+        pending = [x for x in self.load_pending() if x.get("base") != str(base)]
+        self.save_pending(pending)
+
+    def load_pending(self) -> List[Dict]:
+        try:
+            data = json.loads(self.statefile.read_text())
+        except (OSError, ValueError):
+            return []
+        return data if isinstance(data, list) else [data]
+
+    def save_pending(self, items: List[Dict]) -> None:
+        try:
+            if items:
+                self.statefile.write_text(json.dumps(items))
+            else:
+                self.statefile.unlink(missing_ok=True)
+        except OSError as e:
+            log.debug("could not save state: %s", e)
+
+    def finish_pending(self) -> None:
+        """Finish recordings that are not the current one (after a crash or a NAS outage)."""
+        busy = {str(self.base)} if self.base else set()
+        for item in self.load_pending():
+            parts = [Path(p) for p in item.get("parts", [])]
+            if item.get("base") and item["base"] not in busy:
+                if any(p.exists() for p in parts):
+                    log.info("finishing an earlier recording: %s", Path(item["base"]).name)
+                    self.finalize_later(parts, Path(item["base"]))
+                else:
+                    self.forget(Path(item["base"]))
 
     def recover(self) -> None:
         """Clean up after a crash or forced stop: free the camera, finish old files."""
@@ -832,16 +884,7 @@ class Recorder:
             self.video_on = True
             self.close_stream()
         self.pidfile.unlink(missing_ok=True)
-        try:
-            st = json.loads(self.statefile.read_text())
-        except (OSError, ValueError):
-            return
-        parts = [Path(p) for p in st.get("parts", [])]
-        if st.get("base") and parts:
-            log.info("finishing a recording that was interrupted: %s", Path(st["base"]).name)
-            self.finalize_later(parts, Path(st["base"]))
-        else:
-            self.statefile.unlink(missing_ok=True)
+        self.finish_pending()
 
     def step(self) -> None:
         st = self.poll()
@@ -893,6 +936,9 @@ class Recorder:
         while not self.stop_event.is_set():
             try:
                 self.step()
+                if self.retry_at and time.monotonic() > self.retry_at and not any(t.is_alive() for t in self.finalizers):
+                    self.retry_at = None
+                    self.finish_pending()
             except Exception:  # never let one bad poll kill the service
                 log.exception("unexpected error")
                 self.printer.close()

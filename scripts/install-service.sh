@@ -10,6 +10,7 @@ SUPPORT="/Library/Application Support/elegoo-print-recorder"
 LOGS="/Library/Logs/elegoo-print-recorder"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+trap 'echo "  ✗ install failed at scripts/install-service.sh line $LINENO: $BASH_COMMAND"' ERR
 
 # 1. Build the new app next to the old one; the running service is untouched until this works.
 export UV_PYTHON_INSTALL_DIR="$PREFIX/python" UV_CACHE_DIR="$PREFIX/cache" UV_NO_CONFIG=1
@@ -57,7 +58,8 @@ PLIST
 chmod 644 "$PLIST"; chown root:wheel "$PLIST"
 
 # 4. Start it and wait for a fresh "watching printer" line.
-before=$(cat "$LOGS/recorder.log" 2>/dev/null | wc -l | tr -d ' ')
+before=0
+if [ -f "$LOGS/recorder.log" ]; then before=$(wc -l < "$LOGS/recorder.log" | tr -d ' '); fi
 launchctl bootstrap system "$PLIST"
 launchctl enable "system/$LABEL"
 started=no

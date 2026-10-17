@@ -17,6 +17,23 @@ make install
 
 Videos go to **Movies › Printer Recordings**, one `.mp4` per print, at the camera's full quality.
 
+### On a Linux server (Debian/Ubuntu)
+
+```bash
+sudo apt install -y ffmpeg make git && curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/shreyashguptas/elegoo-print-recorder && cd elegoo-print-recorder
+make install                                   # videos in ~/Printer Recordings
+```
+
+Saving to a NAS instead:
+
+```bash
+make nas SHARE=//192.168.1.10/recordings NAS_USER=me    # asks for the NAS password once
+make install OUTPUT=/mnt/recordings
+```
+
+It runs as a systemd service: it starts at boot and restarts if it crashes. If the NAS is offline when a print ends, the video waits on the server and is copied over later.
+
 ## What it does
 
 | When | What happens |
@@ -40,8 +57,9 @@ Videos go to **Movies › Printer Recordings**, one `.mp4` per print, at the cam
 | `make check` | Check the camera |
 | `make status` | What's printing and recording right now |
 | `make logs` | Live log |
+| `make nas` | Linux: connect a NAS share |
 | `make uninstall` | Remove it (your videos stay) |
 
-Tested on a Saturn 4 Ultra (12K), firmware V1.5.2, macOS 27. Other Elegoo printers that use SDCP V3 should work.
+Tested on a Saturn 4 Ultra (12K), firmware V1.5.2, on macOS 27 and Debian 13. Other Elegoo printers that use SDCP V3 should work.
 
 MIT License

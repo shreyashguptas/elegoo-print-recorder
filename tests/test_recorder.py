@@ -220,3 +220,28 @@ def test_same_name_does_not_overwrite(tmp_path):
     src.write_text("second")
     dest = core.move_into(src, a, None)
     assert dest.name == "x (2).mp4" and a.read_text() == "first"
+
+
+@needs_ffmpeg
+def test_nas_offline_keeps_video_and_retries(tmp_path, monkeypatch):
+    part = _camera_like_ts(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    part = part.rename(work / "s2.part01.ts")
+    out = tmp_path / "nas" / "Print.mp4"          # the "NAS" folder does not exist yet
+    real_move = core.move_into
+    calls = {"n": 0}
+
+    def flaky(src, dest, cfg):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("NAS offline")
+        return real_move(src, dest, cfg)
+
+    monkeypatch.setattr(core, "move_into", flaky)
+    with pytest.raises(OSError):
+        core.finalize(FFMPEG, [part], out, keep_ts=False)
+    assert part.exists()                            # nothing lost
+    assert (work / "s2.partial.done").exists()
+    final = core.finalize(FFMPEG, [part], out, keep_ts=False)   # the retry
+    assert final and final.exists() and not part.exists()
