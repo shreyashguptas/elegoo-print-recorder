@@ -42,7 +42,7 @@ It runs as a systemd service: it starts at boot and restarts if it crashes. If t
 | A minute later | It's copied to your recordings folder as `2026-10-16_14-11_My_Part_timelapse.mp4` |
 | Your computer was off | It catches up on every timelapse it missed |
 
-It never uses the camera and never deletes anything from the printer.
+It never uses the camera. Once a day it frees space on the printer: print files not used for 30 days, and timelapses older than 30 days whose copy was verified (`"cleanup_days": 0` turns this off).
 
 Want the full real-time video instead (every second of the print, ~2.5 GB)? Set `"mode": "video"` (or `"both"`) in the settings.
 

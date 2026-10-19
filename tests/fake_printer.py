@@ -34,6 +34,7 @@ class FakePrinter:
         self.booted = time.time()
         self.history = []        # newest first, like the real printer
         self.files = {}          # path -> bytes, served like the printer's port-3030 file server
+        self.local = []          # print files on the printer, e.g. "/local//Part.goo"
         fake = self
 
         class Files(http.server.BaseHTTPRequestHandler):
@@ -46,6 +47,12 @@ class FakePrinter:
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            def do_HEAD(self):
+                import urllib.parse
+                ok = urllib.parse.unquote(self.path) in fake.files
+                self.send_response(200 if ok else 404)
+                self.end_headers()
 
             def log_message(self, *a):
                 pass
@@ -163,7 +170,18 @@ class FakePrinter:
         cmd, data = d["Cmd"], d.get("Data") or {}
         self.calls.append((cmd, data))
         reply = {"Ack": 0}
-        if cmd == 320:
+        if cmd == 258:
+            reply = {"Ack": 0, "FileList": [{"name": f, "type": 1} for f in self.local]}
+        elif cmd == 259:
+            for f in data.get("FileList") or []:
+                if f in self.local:
+                    self.local.remove(f)
+                if f in self.files:
+                    del self.files[f]
+                    for h in self.history:
+                        if h["TimeLapseVideoUrl"] == f:
+                            h["TimeLapseVideoStatus"] = 2
+        elif cmd == 320:
             reply = {"Ack": 0, "HistoryData": [h["TaskId"] for h in self.history]}
         elif cmd == 321:
             want = set(data.get("Id") or [])

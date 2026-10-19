@@ -96,7 +96,7 @@ def test_shutdown_mid_print_saves_the_video(setup):
     fake.layer = 10
     t.start()
     assert wait_for(lambda: fake.video_calls() == [1], 5)
-    time.sleep(5)
+    assert wait_for(lambda: rec.segment is not None and rec.segment.size() > 200_000, 40)   # real video, not a fixed wait
     rec.stop_event.set()
     t.join(60)
     assert len(mp4s(out)) == 1
@@ -509,3 +509,75 @@ def test_printer_offline_then_back(tmp_path):
     rec.next_tl_sync = 0
     assert wait_for(lambda: len(_mp4s(tmp_path)) == 1, 20)
     _stop(rec, t); fake.close()
+
+
+# ---------------------------------------------------------------- printer cleanup
+
+def _days_ago(n):
+    import datetime
+    return (datetime.datetime.now() - datetime.timedelta(days=n)).isoformat(timespec="minutes")
+
+
+@needs_ffmpeg
+def test_cleanup_removes_only_old_and_safe_things(tmp_path):
+    fake = FakePrinter(FFMPEG)
+    clip = _small_mp4(tmp_path)
+    fake.local = ["/local//Old.goo", "/local//Recent.goo", "/local//Printing.goo"]
+    fake.add_history("Old.goo", "old1", 1, clip, ago=600)        # copied, but "40 days old" (below)
+    fake.add_history("Recent.goo", "new1", 1, clip, ago=300)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "printer-files-seen.json").write_text(json.dumps(
+        {"Old.goo": _days_ago(40), "Recent.goo": _days_ago(2), "Printing.goo": _days_ago(40)}))
+    (work / "print-starts.json").write_text(json.dumps({"old1": _days_ago(40), "new1": _days_ago(2)}))
+    rec, t = _new_rec(fake, tmp_path)
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 2, 15)            # both timelapses copied first
+    rec.cleanup.next_run = 0
+    rec.tl_watch_until = 0
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: "/local//Old.goo" not in fake.local, 15)
+    time.sleep(1)
+    assert "/local//Recent.goo" in fake.local
+    old_url = [h for h in fake.history if h["TaskId"] == "old1"][0]["TimeLapseVideoUrl"]
+    new_url = [h for h in fake.history if h["TaskId"] == "new1"][0]["TimeLapseVideoUrl"]
+    assert old_url not in fake.files and new_url in fake.files     # only the old, copied timelapse
+    assert len(_mp4s(tmp_path)) == 2                                # NAS copies untouched
+    _stop(rec, t); fake.close()
+
+
+@needs_ffmpeg
+def test_cleanup_never_runs_while_printing_and_keeps_uncopied(tmp_path):
+    fake = FakePrinter(FFMPEG)
+    fake.local = ["/local//Printing.goo"]
+    fake.add_history("Uncopied.goo", "u1", 1, b"not a playable video", ago=60)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "printer-files-seen.json").write_text(json.dumps({"Printing.goo": _days_ago(90)}))
+    (work / "print-starts.json").write_text(json.dumps({"u1": _days_ago(90)}))
+    fake.start_print("Printing.goo", "p1")
+    fake.layer = 20
+    rec, t = _new_rec(fake, tmp_path)
+    time.sleep(3)
+    assert fake.local == ["/local//Printing.goo"]                  # nothing while printing
+    fake.finish_print()
+    assert wait_for(lambda: rec.was_printing is False, 10)
+    rec.cleanup.next_run = 0
+    rec.tl_watch_until = 0
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: fake.local == [], 15)                   # old file removed once idle
+    assert [h for h in fake.history if h["TaskId"] == "u1"][0]["TimeLapseVideoUrl"] in fake.files  # never copied: kept
+    _stop(rec, t); fake.close()
+
+
+def test_start_time_uses_elapsed_print_time(tmp_path):
+    rec = types_ns(work=tmp_path)
+    tl = core.TimelapseSync(rec)
+    tl.note_start("x", elapsed=3 * 3600)
+    import datetime
+    got = datetime.datetime.fromisoformat(json.loads((tmp_path / "print-starts.json").read_text())["x"])
+    assert abs((datetime.datetime.now() - got).total_seconds() - 3 * 3600) < 120
+
+
+def types_ns(**kw):
+    import types
+    return types.SimpleNamespace(**kw)

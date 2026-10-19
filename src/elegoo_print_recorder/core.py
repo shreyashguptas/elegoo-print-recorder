@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 APP = "elegoo-print-recorder"
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 IS_MAC = sys.platform == "darwin"
 if IS_MAC:
     # The macOS service is a system LaunchDaemon (macOS exempts those from Local
@@ -66,6 +66,8 @@ DEFAULTS = {
                                    # "video": record the full camera stream; "both": do both
     "timelapse_sync_minutes": 10,  # also look for new timelapses this often
     "files_url": "",               # where the printer serves its files (default http://<printer>:3030)
+    "cleanup_days": 30,            # remove print files and copied timelapses older than this from
+                                   # the printer (checked daily, never while printing); 0 = never
     "idle_check_minutes": 10,      # between prints, warn if the camera is already full
     "owner_uid": -1,               # recordings are handed to this user (the service runs as root)
     "owner_gid": -1,
@@ -417,6 +419,7 @@ def print_state(status: Dict) -> Dict:
         "total_layers": int(info.get("TotalLayer") or 0),
         "print_status": pstatus,
         "error": int(info.get("ErrorNumber") or 0),
+        "elapsed": float(info.get("CurrentTicks") or 0) / 1000,   # seconds since the print started
     }
 
 
@@ -703,11 +706,14 @@ class TimelapseSync:
         self.startsfile = rec.work / "print-starts.json"
         self.started = time.time()
 
-    def note_start(self, task_id: str) -> None:
-        """Remember when a print really started (the printer's clock resets when it restarts)."""
+    def note_start(self, task_id: str, elapsed: float = 0) -> None:
+        """Remember when a print really started (the printer's clock resets when it restarts).
+        Uses the printer's elapsed time, so a print first seen halfway through still gets
+        its real start."""
         starts = self._read(self.startsfile)
         if task_id and task_id not in starts:
-            starts[task_id] = dt.datetime.now().isoformat(timespec="minutes")
+            start = dt.datetime.now() - dt.timedelta(seconds=max(0.0, elapsed))
+            starts[task_id] = start.isoformat(timespec="minutes")
             self._write(self.startsfile, starts)
 
     @staticmethod
@@ -871,6 +877,96 @@ def check_destination(out: Path) -> None:
         raise OSError(f"{p} is not mounted (is the NAS offline?)")
 
 
+# --------------------------------------------------------------------------- printer cleanup
+
+class PrinterCleanup:
+    """Once a day, frees space on the printer: print files (.goo) not printed for
+    cleanup_days, and timelapses older than that whose copy was verified. Never while a
+    print runs, never the file being printed, and every delete is checked afterwards
+    (the printer answers "OK" even when nothing was deleted)."""
+
+    def __init__(self, rec: "Recorder"):
+        self.rec = rec
+        self.seenfile = rec.work / "printer-files-seen.json"
+        self.next_run = 0.0
+        self.timelapse_delete_works = True
+
+    def due(self, now: float, printing: bool) -> bool:
+        return int(self.rec.cfg.get("cleanup_days") or 0) > 0 and not printing and now >= self.next_run
+
+    def run(self, now: float) -> None:
+        self.next_run = now + 24 * 3600
+        days = int(self.rec.cfg["cleanup_days"])
+        cutoff = dt.datetime.now() - dt.timedelta(days=days)
+        p, tl = self.rec.printer, self.rec.timelapses
+        history = tl.history()
+        when = tl.wall_clock(history)
+        today = dt.datetime.now().isoformat(timespec="minutes")
+
+        # print files: age = last time printed, or first time the Dell saw the file
+        files = [f["name"] for f in p.request(258, {"Url": "/local/"}).get("FileList") or [] if f.get("type") == 1]
+        seen = TimelapseSync._read(self.seenfile)
+        for f in files:
+            seen.setdefault(Path(f).name, today)
+        seen = {k: v for k, v in seen.items() if k in {Path(f).name for f in files}}
+        TimelapseSync._write(self.seenfile, seen)
+        last_printed: Dict[str, dt.datetime] = {}
+        for t in history:
+            name, start = Path(t.get("TaskName") or "").name, when.get(t.get("TaskId", ""))
+            if start and (name not in last_printed or start > last_printed[name]):
+                last_printed[name] = start
+        old = []
+        for f in files:
+            name = Path(f).name
+            newest = max([dt.datetime.fromisoformat(seen[name])] + ([last_printed[name]] if name in last_printed else []))
+            if newest < cutoff:
+                old.append(f)
+        if old:
+            self.delete_print_files(old)
+
+        # timelapses: only ones whose copy was verified, and older than the cutoff
+        if not self.timelapse_delete_works:
+            return
+        done = tl.load()
+        for t in history:
+            tid, url = t.get("TaskId", ""), t.get("TimeLapseVideoUrl") or ""
+            start = when.get(tid) or (dt.datetime.fromisoformat(tl._read(tl.startsfile)[tid])
+                                      if tid in tl._read(tl.startsfile) else None)
+            copied = done.get(tid, {}).get("status") == "saved" or tid in tl.manifest_ids()
+            if t.get("TimeLapseVideoStatus") != 1 or not url or not copied or not start or start >= cutoff:
+                continue
+            p.request(259, {"FileList": [url], "FolderList": []})
+            if self.timelapse_gone(url):
+                log.info("cleanup: removed printer timelapse %s (its copy is safe)", url)
+            else:
+                log.info("cleanup: this printer does not allow deleting timelapses; leaving them (they are small)")
+                self.timelapse_delete_works = False
+                return
+
+    def delete_print_files(self, paths: List[str]) -> None:
+        p = self.rec.printer
+        p.request(259, {"FileList": paths, "FolderList": []})
+        left = {f["name"] for f in p.request(258, {"Url": "/local/"}).get("FileList") or []}
+        for f in paths:
+            if f in left:
+                log.warning("cleanup: printer kept %s", f)
+            else:
+                log.info("cleanup: removed old print file %s", f)
+
+    def timelapse_gone(self, url: str) -> bool:
+        import urllib.parse
+        import urllib.request
+        base = self.rec.cfg.get("files_url") or f"http://{self.rec.printer.ip}:{self.rec.cfg['ws_port']}"
+        try:
+            urllib.request.urlopen(urllib.request.Request(base.rstrip("/") + urllib.parse.quote(url), method="HEAD"),
+                                   timeout=15).close()
+            return False
+        except urllib.error.HTTPError as e:
+            return e.code == 404
+        except OSError:
+            return False
+
+
 # --------------------------------------------------------------------------- recorder
 
 def pid_is_ffmpeg(pid: int) -> bool:
@@ -913,6 +1009,7 @@ class Recorder:
         self.finalizers: List[threading.Thread] = []
         self.mode = cfg.get("mode") or "timelapse"
         self.timelapses = TimelapseSync(self)
+        self.cleanup = PrinterCleanup(self)
         self.next_tl_sync = 0.0       # sync at startup (catches up on anything missed)
         self.tl_watch_until = 0.0     # after a print ends, check often until its timelapse is copied
         self.was_printing: Optional[bool] = None
@@ -1139,7 +1236,7 @@ class Recorder:
 
     def step_timelapse(self, st: Dict, now: float) -> None:
         if st["printing"] and st["task_id"]:
-            self.timelapses.note_start(st["task_id"])
+            self.timelapses.note_start(st["task_id"], st.get("elapsed", 0))
         if self.was_printing and not st["printing"]:
             log.info("print ended; watching for its timelapse")
             self.tl_watch_until = now + 20 * 60
@@ -1155,6 +1252,12 @@ class Recorder:
             pending = True
         watching = pending or now < self.tl_watch_until
         self.next_tl_sync = now + (30 if watching else 60 * float(self.cfg["timelapse_sync_minutes"]))
+        if not watching and self.cleanup.due(now, st["printing"]):
+            try:
+                self.cleanup.run(now)
+            except (OSError, SDCPError, WebSocketClosed, ValueError) as e:
+                log.warning("cleanup skipped: %s", e)
+                self.printer.close()
 
     def check_idle_camera(self, now: float) -> None:
         """Between prints, warn once if the camera is already full (stuck viewers)."""

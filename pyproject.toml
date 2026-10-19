@@ -1,6 +1,6 @@
 [project]
 name = "elegoo-print-recorder"
-version = "0.3.1"
+version = "0.4.0"
 description = "Automatically record every print from an Elegoo resin printer's camera on a Mac."
 readme = "README.md"
 requires-python = ">=3.9"
