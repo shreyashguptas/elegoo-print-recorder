@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 APP = "elegoo-print-recorder"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 IS_MAC = sys.platform == "darwin"
 if IS_MAC:
     # The macOS service is a system LaunchDaemon (macOS exempts those from Local
@@ -62,6 +62,10 @@ DEFAULTS = {
     "ws_port": 3030,
     "discovery_port": 3000,
     "notify_url": "",              # e.g. https://ntfy.sh/<your-topic>: phone alerts (ntfy app)
+    "mode": "timelapse",           # "timelapse": copy the printer's own timelapses (no camera use)
+                                   # "video": record the full camera stream; "both": do both
+    "timelapse_sync_minutes": 10,  # also look for new timelapses this often
+    "files_url": "",               # where the printer serves its files (default http://<printer>:3030)
     "idle_check_minutes": 10,      # between prints, warn if the camera is already full
     "owner_uid": -1,               # recordings are handed to this user (the service runs as root)
     "owner_gid": -1,
@@ -284,6 +288,7 @@ class Printer:
         self.ws: Optional[WebSocket] = None
         self.status: Dict = {}
         self.attributes: Dict = {}
+        self.uptime: Optional[Tuple[float, float]] = None
         self.lock = threading.Lock()
 
     def connect(self) -> None:
@@ -300,6 +305,8 @@ class Printer:
         topic = msg.get("Topic", "")
         if msg.get("MainboardID") and not self.mainboard_id:
             self.mainboard_id = msg["MainboardID"]
+        if isinstance(msg.get("TimeStamp"), (int, float)) and "/request/" not in msg.get("Topic", ""):
+            self.uptime = (float(msg["TimeStamp"]), time.time())  # printer clock = seconds since boot
         if "/status/" in topic and isinstance(msg.get("Status"), dict):
             self.status = msg["Status"]
         elif "/attributes/" in topic and isinstance(msg.get("Attributes"), dict):
@@ -675,6 +682,121 @@ def notify(cfg: Dict, title: str, message: str, priority: str = "default", tags:
     threading.Thread(target=send, daemon=True).start()
 
 
+# --------------------------------------------------------------------------- printer timelapses
+
+TL_NAMES = {0: "not taken", 1: "ready", 2: "deleted", 3: "being made", 4: "failed"}
+
+
+class TimelapseSync:
+    """Copies the printer's own timelapse of each finished print to the recordings folder.
+
+    Uses the printer's print history (SDCP Cmd 320/321). Never touches the camera and
+    never deletes anything from the printer. A copy only counts once its size matches
+    and it plays; otherwise it is tried again on the next sync.
+    """
+
+    def __init__(self, rec: "Recorder"):
+        self.rec = rec
+        self.statefile = rec.work / "timelapses.json"
+        self.started = time.time()
+
+    def load(self) -> Dict:
+        try:
+            return json.loads(self.statefile.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, done: Dict) -> None:
+        tmp = self.statefile.with_suffix(".tmp")
+        tmp.write_text(json.dumps(done, indent=1))
+        os.replace(tmp, self.statefile)
+
+    def history(self) -> List[Dict]:
+        p = self.rec.printer
+        ids = p.request(320, {}).get("HistoryData") or []
+        out: List[Dict] = []
+        for i in range(0, len(ids), 8):
+            out += p.request(321, {"Id": ids[i:i + 8]}).get("HistoryDetailList") or []
+        return out  # newest first
+
+    def wall_clock(self, items: List[Dict]) -> Dict[str, Optional[dt.datetime]]:
+        """Real start time of each print. The printer only knows seconds since boot, so
+        this works for prints since its last restart (newest entries until the clock jumps)."""
+        when: Dict[str, Optional[dt.datetime]] = {}
+        up = self.rec.printer.uptime
+        same_boot, prev = up is not None, None
+        for t in items:
+            b = float(t.get("BeginTime") or 0)
+            if prev is not None and b > prev:
+                same_boot = False
+            prev = b
+            if same_boot and up and b <= up[0] + (time.time() - up[1]):
+                when[t.get("TaskId", "")] = dt.datetime.fromtimestamp(up[1] - (up[0] - b))
+            else:
+                when[t.get("TaskId", "")] = None
+        return when
+
+    def sync(self) -> bool:
+        """Copy every ready timelapse not copied yet. Returns True if one is still being made."""
+        cfg, rec = self.rec.cfg, self.rec
+        items = self.history()
+        when = self.wall_clock(items)
+        done = self.load()
+        pending = False
+        for t in items:
+            tid = t.get("TaskId")
+            if not tid or tid in done:
+                continue
+            status, url = t.get("TimeLapseVideoStatus"), t.get("TimeLapseVideoUrl") or ""
+            name = safe_name(Path(t.get("TaskName") or "print").name)
+            if status == 3:
+                pending = True
+                continue
+            if status != 1 or not url:
+                done[tid] = {"status": TL_NAMES.get(status, str(status)), "print": name}
+                self.save(done)
+                start = when.get(tid)
+                if start and start.timestamp() >= self.started - 6 * 3600 and t.get("TaskStatus") == 1:
+                    notify(cfg, "No timelapse for this print",
+                           f"{name}: the printer reports its timelapse as {TL_NAMES.get(status, status)}.",
+                           priority="high", tags="warning")
+                continue
+            start = when.get(tid)
+            stamp = start.strftime("%Y-%m-%d_%H-%M") if start else f"undated_{tid[:8]}"
+            target = Path(cfg["output_dir"]) / f"{stamp}_{name}_timelapse.mp4"
+            final = self.copy(url, target)
+            if final:
+                done[tid] = {"status": "saved", "file": final.name, "print": name}
+                self.save(done)
+                log.info("saved printer timelapse %s (%.1f MB)", final, final.stat().st_size / 1e6)
+                if not start or start.timestamp() >= self.started - 6 * 3600:
+                    notify(cfg, "Print timelapse saved", f"{final.name} ({final.stat().st_size / 1e6:.0f} MB)",
+                           tags="movie_camera")
+        return pending
+
+    def copy(self, url: str, target: Path) -> Optional[Path]:
+        import urllib.request
+        import urllib.parse
+        base = self.rec.cfg.get("files_url") or f"http://{self.rec.printer.ip}:{self.rec.cfg['ws_port']}"
+        src = base.rstrip("/") + urllib.parse.quote(url)
+        tmp = self.rec.work / (target.stem + ".download.mp4")
+        try:
+            with urllib.request.urlopen(src, timeout=60) as r, open(tmp, "wb") as f:
+                expected = int(r.headers.get("Content-Length") or -1)
+                shutil.copyfileobj(r, f, 1 << 20)
+            size = tmp.stat().st_size
+            if size == 0 or (expected >= 0 and size != expected):
+                raise OSError(f"download incomplete ({size} of {expected} bytes)")
+            if not file_video_info(self.rec.ffmpeg, tmp):
+                raise OSError("downloaded file is not a playable video")
+            make_output_dir(self.rec.cfg)
+            return move_into(tmp, target, self.rec.cfg)
+        except Exception as e:
+            log.warning("could not copy timelapse %s: %s (will retry)", url, e)
+            tmp.unlink(missing_ok=True)
+            return None
+
+
 # --------------------------------------------------------------------------- recorder
 
 def pid_is_ffmpeg(pid: int) -> bool:
@@ -715,6 +837,11 @@ class Recorder:
         self.last_discovery = 0.0
         self.retry_at: Optional[float] = None
         self.finalizers: List[threading.Thread] = []
+        self.mode = cfg.get("mode") or "timelapse"
+        self.timelapses = TimelapseSync(self)
+        self.next_tl_sync = 0.0       # sync at startup (catches up on anything missed)
+        self.tl_watch_until = 0.0     # after a print ends, check often until its timelapse is copied
+        self.was_printing: Optional[bool] = None
 
     # ---- printer connection
 
@@ -936,6 +1063,23 @@ class Recorder:
         self.pidfile.unlink(missing_ok=True)
         self.finish_pending()
 
+    def step_timelapse(self, st: Dict, now: float) -> None:
+        if self.was_printing and not st["printing"]:
+            log.info("print ended; watching for its timelapse")
+            self.tl_watch_until = now + 20 * 60
+            self.next_tl_sync = now + 15
+        self.was_printing = st["printing"]
+        if now < self.next_tl_sync:
+            return
+        try:
+            pending = self.timelapses.sync()
+        except (OSError, SDCPError, WebSocketClosed) as e:
+            log.debug("timelapse sync failed: %s", e)
+            self.printer.close()
+            pending = True
+        watching = pending or now < self.tl_watch_until
+        self.next_tl_sync = now + (30 if watching else 60 * float(self.cfg["timelapse_sync_minutes"]))
+
     def check_idle_camera(self, now: float) -> None:
         """Between prints, warn once if the camera is already full (stuck viewers)."""
         if now < self.next_idle_check:
@@ -963,6 +1107,10 @@ class Recorder:
     def step(self) -> None:
         st = self.poll()
         now = time.monotonic()
+        if self.mode in ("timelapse", "both") and st is not None:
+            self.step_timelapse(st, now)
+        if self.mode == "timelapse":
+            return
         recording = self.base is not None
 
         if st is None:
@@ -1004,8 +1152,10 @@ class Recorder:
 
     def run(self) -> None:
         self.work.mkdir(parents=True, exist_ok=True)
-        log.info("%s %s watching printer %s, saving to %s", APP, VERSION, self.printer.ip, self.out_dir)
-        if firewall_blocks(self.ffmpeg):
+        log.info("%s %s watching printer %s, saving %s to %s", APP, VERSION, self.printer.ip,
+                 {"timelapse": "printer timelapses", "video": "camera video", "both": "video and timelapses"}
+                 .get(self.mode, self.mode), self.out_dir)
+        if self.mode != "timelapse" and firewall_blocks(self.ffmpeg):
             log.warning("the macOS firewall may block video for %s. Run `make install` again "
                         "(needed after `brew upgrade ffmpeg`).", os.path.realpath(self.ffmpeg))
         self.recover()

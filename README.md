@@ -1,6 +1,6 @@
 # Elegoo Print Recorder
 
-Every print on your Elegoo resin printer, recorded by its own camera on your Mac. Automatically.
+Every print's timelapse from your Elegoo resin printer, copied to your Mac, server or NAS. Automatically.
 
 <!-- demo GIF goes here -->
 
@@ -38,13 +38,18 @@ It runs as a systemd service: it starts at boot and restarts if it crashes. If t
 
 | When | What happens |
 |---|---|
-| A print starts | Recording starts right away |
-| The print ends | 2 minutes later it saves `2026-10-16_14-11_My_Part.mp4` |
-| Your Mac restarts | It starts again by itself |
+| A print finishes | The printer makes its own timelapse (~6 s, 1280×720, ~7 MB) |
+| A minute later | It's copied to your recordings folder as `2026-10-16_14-11_My_Part_timelapse.mp4` |
+| Your computer was off | It catches up on every timelapse it missed |
+
+It never uses the camera and never deletes anything from the printer.
+
+Want the full real-time video instead (every second of the print, ~2.5 GB)? Set `"mode": "video"` (or `"both"`) in the settings.
 
 ## Good to know
 
-- **The camera only sends video while a print is running.** Run `make check` during a print to see the feed working.
+- **Stopped prints get no timelapse.** The printer only makes one when a print completes.
+- Timelapse needs to be on in the printer's settings (it is by default).
 - **The printer allows 2 camera viewers** (Lychee, the Elegoo app, this recorder). If both are taken, close one.
 - **Camera stuck as "full"?** The printer never frees a viewer that crashed. Turn the printer off and on while it's idle.
 - **Phone alerts:** put `"notify_url": "https://ntfy.sh/<a-random-topic>"` in the settings and subscribe to that topic in the free [ntfy](https://ntfy.sh) app. You get a ping if a print can't be recorded, if the camera is full between prints, and when each video is saved.

@@ -7,6 +7,9 @@ import socket
 import struct
 import subprocess
 import threading
+import time
+import http.server
+import os
 
 
 class FakePrinter:
@@ -28,6 +31,28 @@ class FakePrinter:
         self.calls = []          # (cmd, data) for every request
         self.feeder = None
         self.running = True
+        self.booted = time.time()
+        self.history = []        # newest first, like the real printer
+        self.files = {}          # path -> bytes, served like the printer's port-3030 file server
+        fake = self
+
+        class Files(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                import urllib.parse
+                data = fake.files.get(urllib.parse.unquote(self.path))
+                if data is None:
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        self.http = http.server.HTTPServer(("127.0.0.1", 0), Files)
+        self.files_url = f"http://127.0.0.1:{self.http.server_port}"
+        threading.Thread(target=self.http.serve_forever, daemon=True).start()
         threading.Thread(target=self._accept, daemon=True).start()
 
     # ---- test controls
@@ -47,6 +72,18 @@ class FakePrinter:
     def drop_video(self):
         self._stop_feeder()
 
+    def uptime(self):
+        return int(time.time() - self.booted)
+
+    def add_history(self, name, task_id, status, data=b"", ago=0, task_status=1):
+        """Add a finished print. status: 1 ready, 3 being made, 4 failed."""
+        url = f"/media/mmcblk0p2/local_{task_id}.mp4"
+        if data:
+            self.files[url] = data
+        self.history.insert(0, {"TaskId": task_id, "TaskName": f"/media/mmcblk0p3/{name}",
+                                "BeginTime": max(0, self.uptime() - ago), "TaskStatus": task_status,
+                                "TimeLapseVideoStatus": status, "TimeLapseVideoUrl": url if status in (1, 3) else ""})
+
     def video_calls(self):
         return [d.get("Enable") for c, d in self.calls if c == 386]
 
@@ -54,6 +91,7 @@ class FakePrinter:
         self.running = False
         self._stop_feeder()
         self.srv.close()
+        self.http.shutdown()
 
     # ---- video
     def _start_feeder(self):
@@ -125,7 +163,12 @@ class FakePrinter:
         cmd, data = d["Cmd"], d.get("Data") or {}
         self.calls.append((cmd, data))
         reply = {"Ack": 0}
-        if cmd == 386:
+        if cmd == 320:
+            reply = {"Ack": 0, "HistoryData": [h["TaskId"] for h in self.history]}
+        elif cmd == 321:
+            want = set(data.get("Id") or [])
+            reply = {"Ack": 0, "HistoryDetailList": [h for h in self.history if h["TaskId"] in want]}
+        elif cmd == 386:
             if data.get("Enable"):
                 if self.viewers >= self.max_viewers:
                     reply = {"Ack": 1}
@@ -143,7 +186,7 @@ class FakePrinter:
                 self._send(c, {"Status": {"CurrentStatus": self.machine, "PrintInfo": {
                     "Status": self.print_status, "CurrentLayer": self.layer, "TotalLayer": 100,
                     "Filename": self.filename, "TaskId": self.task, "ErrorNumber": 0}},
-                    "MainboardID": "fakeboard", "Topic": "sdcp/status/fakeboard"})
+                    "MainboardID": "fakeboard", "TimeStamp": self.uptime(), "Topic": "sdcp/status/fakeboard"})
             elif cmd == 1:
                 self._send(c, {"Attributes": {"MachineName": "Fake Saturn", "FirmwareVersion": "V0",
                                               "NumberOfVideoStreamConnected": self.viewers,

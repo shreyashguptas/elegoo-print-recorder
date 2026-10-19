@@ -34,7 +34,7 @@ def setup(tmp_path):
     fake = FakePrinter(FFMPEG or "ffmpeg")
     cfg = dict(core.DEFAULTS, printer_ip="127.0.0.1", ws_port=fake.port, output_dir=str(tmp_path / "out"),
                poll_seconds=0.5, stop_delay_seconds=2, start_at_layer=3, stall_seconds=4,
-               offline_end_seconds=5, ffmpeg=FFMPEG or "", work_dir=str(tmp_path / "work"))
+               offline_end_seconds=5, ffmpeg=FFMPEG or "", work_dir=str(tmp_path / "work"), mode="video")
     rec = core.Recorder(cfg)
     t = threading.Thread(target=rec.run, daemon=True)
     yield fake, rec, t, Path(cfg["output_dir"])
@@ -202,7 +202,7 @@ def test_interrupted_recording_is_finished_on_restart(tmp_path):
     (work / "session.json").write_text(json.dumps({"base": str(out / "Old Print.mp4"), "parts": [str(part)]}))
     fake = FakePrinter(FFMPEG)
     cfg = dict(core.DEFAULTS, printer_ip="127.0.0.1", ws_port=fake.port, output_dir=str(out), poll_seconds=0.5,
-               ffmpeg=FFMPEG, work_dir=str(work))
+               ffmpeg=FFMPEG, work_dir=str(work), mode="video")
     rec = core.Recorder(cfg)
     t = threading.Thread(target=rec.run, daemon=True)
     t.start()
@@ -308,3 +308,81 @@ def test_alert_when_nothing_recorded_and_when_idle_camera_full(setup):
     fake.viewers = 0
     assert wait_for(lambda: "Camera is free again" in inbox.titles(), 10)
     assert all(a[1] == "high" for a in inbox.alerts if "NOT" in a[0] or "won't" in a[0])
+
+
+
+# ---------------------------------------------------------------- printer timelapses
+
+def _small_mp4(tmp_path):
+    f = tmp_path / "tl.mp4"
+    subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30", "-t", "2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", str(f)], check=True)
+    return f.read_bytes()
+
+
+@pytest.fixture
+def tl(tmp_path):
+    fake = FakePrinter(FFMPEG or "ffmpeg")
+    inbox = AlertInbox()
+    cfg = dict(core.DEFAULTS, printer_ip="127.0.0.1", ws_port=fake.port, output_dir=str(tmp_path / "nas"),
+               poll_seconds=0.3, ffmpeg=FFMPEG or "", work_dir=str(tmp_path / "work"), mode="timelapse",
+               files_url=fake.files_url, notify_url=inbox.url)
+    rec = core.Recorder(cfg)
+    t = threading.Thread(target=rec.run, daemon=True)
+    yield fake, rec, t, Path(cfg["output_dir"]), inbox
+    rec.stop_event.set()
+    t.join(30)
+    fake.close()
+
+
+@needs_ffmpeg
+def test_copies_existing_timelapses_once_and_never_uses_camera(tl, tmp_path):
+    fake, rec, t, out, inbox = tl
+    clip = _small_mp4(tmp_path)
+    fake.add_history("Old Part.goo", "aaaa1111", 1, clip, ago=3600)
+    fake.add_history("Stopped.goo", "bbbb2222", 4, ago=1800, task_status=3)
+    fake.add_history("Newest Part.goo", "cccc3333", 1, clip, ago=600)
+    t.start()
+    assert wait_for(lambda: len(list(out.glob("*_timelapse.mp4"))) == 2, 15)
+    names = sorted(p.name for p in out.glob("*.mp4"))
+    assert any(n.endswith("_Old_Part_timelapse.mp4") for n in names)
+    assert any(n.endswith("_Newest_Part_timelapse.mp4") for n in names)
+    assert all(n[:4].isdigit() for n in names)           # real dates from the printer's clock
+    assert all(f.stat().st_size == len(clip) for f in out.glob("*.mp4"))
+    rec.next_tl_sync = 0
+    time.sleep(2)
+    assert len(list(out.glob("*.mp4"))) == 2              # not copied twice
+    assert fake.video_calls() == []                       # camera never touched
+    assert not list((tmp_path / "work").glob("*.download.mp4"))
+
+
+@needs_ffmpeg
+def test_waits_for_a_timelapse_being_made_after_a_print(tl, tmp_path):
+    fake, rec, t, out, inbox = tl
+    clip = _small_mp4(tmp_path)
+    fake.start_print("Fresh.goo", "dddd4444")
+    fake.layer = 50
+    t.start()
+    time.sleep(1.5)
+    fake.finish_print()
+    fake.add_history("Fresh.goo", "dddd4444", 3, ago=60)    # printer still writing it
+    time.sleep(2)
+    assert not list(out.glob("*.mp4")) if out.exists() else True
+    fake.history[0]["TimeLapseVideoStatus"] = 1
+    fake.files[fake.history[0]["TimeLapseVideoUrl"]] = clip
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: out.exists() and len(list(out.glob("*_Fresh_timelapse.mp4"))) == 1, 40)
+    assert wait_for(lambda: "Print timelapse saved" in inbox.titles(), 5)
+
+
+@needs_ffmpeg
+def test_broken_download_is_retried_not_saved(tl, tmp_path):
+    fake, rec, t, out, inbox = tl
+    fake.add_history("Bad.goo", "eeee5555", 1, b"not a video at all", ago=60)
+    t.start()
+    time.sleep(3)
+    assert not (out.exists() and list(out.glob("*.mp4")))
+    assert "eeee5555" not in rec.timelapses.load()        # still pending, will retry
+    fake.files[fake.history[0]["TimeLapseVideoUrl"]] = _small_mp4(tmp_path)
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: out.exists() and len(list(out.glob("*_Bad_timelapse.mp4"))) == 1, 15)
