@@ -245,3 +245,66 @@ def test_nas_offline_keeps_video_and_retries(tmp_path, monkeypatch):
     assert (work / "s2.partial.done").exists()
     final = core.finalize(FFMPEG, [part], out, keep_ts=False)   # the retry
     assert final and final.exists() and not part.exists()
+
+
+class AlertInbox:
+    """A tiny local stand-in for ntfy that records every alert."""
+
+    def __init__(self):
+        import http.server
+        inbox = self.alerts = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+                inbox.append((self.headers.get("Title"), self.headers.get("Priority"), body))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.srv.server_port}/topic"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def titles(self):
+        return [a[0] for a in self.alerts]
+
+
+@needs_ffmpeg
+def test_alerts_when_camera_full_and_when_recording_starts(setup):
+    fake, rec, t, out = setup
+    inbox = AlertInbox()
+    rec.cfg["notify_url"] = inbox.url
+    fake.viewers = fake.max_viewers                 # stuck viewers
+    fake.start_print("Alert Part.goo")
+    fake.layer = 5
+    t.start()
+    assert wait_for(lambda: "Print is NOT being recorded" in inbox.titles(), 10)
+    time.sleep(2)
+    assert inbox.titles().count("Print is NOT being recorded") == 1   # once, not every poll
+    fake.viewers = 0                                # a slot frees up
+    rec.next_stream_try = 0
+    assert wait_for(lambda: "Recording started" in inbox.titles(), 15)
+    time.sleep(4)
+    fake.finish_print()
+    assert wait_for(lambda: "Print video saved" in inbox.titles(), 40)
+
+
+@needs_ffmpeg
+def test_alert_when_nothing_recorded_and_when_idle_camera_full(setup):
+    fake, rec, t, out = setup
+    inbox = AlertInbox()
+    rec.cfg.update(notify_url=inbox.url, idle_check_minutes=0)
+    fake.viewers = fake.max_viewers
+    fake.start_print("Lost Part.goo")
+    fake.layer = 5
+    t.start()
+    assert wait_for(lambda: "Print is NOT being recorded" in inbox.titles(), 10)
+    fake.finish_print()
+    assert wait_for(lambda: "Print was NOT recorded" in inbox.titles(), 15)
+    assert wait_for(lambda: "Next print won't be recorded" in inbox.titles(), 10)
+    fake.viewers = 0
+    assert wait_for(lambda: "Camera is free again" in inbox.titles(), 10)
+    assert all(a[1] == "high" for a in inbox.alerts if "NOT" in a[0] or "won't" in a[0])

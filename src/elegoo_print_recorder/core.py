@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 APP = "elegoo-print-recorder"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 IS_MAC = sys.platform == "darwin"
 if IS_MAC:
     # The macOS service is a system LaunchDaemon (macOS exempts those from Local
@@ -52,7 +52,7 @@ DEFAULTS = {
     "mainboard_id": "",            # lets us find the printer again if its IP changes
     "output_dir": str(DEFAULT_OUTPUT),
     "stop_delay_seconds": 120,     # keep recording this long after a print ends
-    "start_at_layer": 3,           # see README: asking for video in layers 1-2 can wedge the camera
+    "start_at_layer": 1,           # claim the camera as soon as the print starts
     "poll_seconds": 5,
     "stall_seconds": 45,           # restart ffmpeg if the file stops growing this long
     "offline_end_seconds": 90,     # printer unreachable this long while recording = print over
@@ -61,6 +61,8 @@ DEFAULTS = {
     "ffmpeg": "",                  # auto-detected when empty
     "ws_port": 3030,
     "discovery_port": 3000,
+    "notify_url": "",              # e.g. https://ntfy.sh/<your-topic>: phone alerts (ntfy app)
+    "idle_check_minutes": 10,      # between prints, warn if the camera is already full
     "owner_uid": -1,               # recordings are handed to this user (the service runs as root)
     "owner_gid": -1,
 }
@@ -653,6 +655,26 @@ def _deliver(tmp: Path, parts: List[Path], out: Path, keep_ts: bool, cfg: Option
     return final
 
 
+# --------------------------------------------------------------------------- alerts
+
+def notify(cfg: Dict, title: str, message: str, priority: str = "default", tags: str = "") -> None:
+    """Send a phone alert through ntfy (https://ntfy.sh) if notify_url is set. Never blocks."""
+    url = (cfg.get("notify_url") or "").strip()
+    if not url:
+        return
+
+    def send():
+        import urllib.request
+        req = urllib.request.Request(url, data=message.encode(), method="POST", headers={
+            "Title": title.encode("ascii", "replace").decode(), "Priority": priority, "Tags": tags})
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception as e:
+            log.warning("could not send alert: %s", e)
+
+    threading.Thread(target=send, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- recorder
 
 def pid_is_ffmpeg(pid: int) -> bool:
@@ -685,6 +707,10 @@ class Recorder:
         self.end_deadline: Optional[float] = None
         self.next_stream_try = 0.0
         self.last_full_warning = 0.0
+        self.alerted_full = False          # alerted that this print can't be recorded yet
+        self.idle_full_alerted = False     # alerted that the camera is full between prints
+        self.next_idle_check = 0.0
+        self.print_name = ""
         self.last_ok = time.monotonic()
         self.last_discovery = 0.0
         self.retry_at: Optional[float] = None
@@ -750,6 +776,14 @@ class Recorder:
         return url
 
     def warn_full(self, used, cap) -> None:
+        if self.base is not None and not self.alerted_full:
+            self.alerted_full = True
+            notify(self.cfg, "Print is NOT being recorded",
+                   f"{self.print_name}: the printer camera is full ({used if used is not None else '?'} of "
+                   f"{cap if cap is not None else 2} viewers). Close Lychee's camera and the Elegoo app camera. "
+                   "If that doesn't help, the printer has stuck viewers: restart it after this print. "
+                   "Recording starts by itself as soon as a slot frees up.",
+                   priority="high", tags="warning,camera")
         if time.monotonic() - self.last_full_warning > 600:
             self.last_full_warning = time.monotonic()
             log.warning("camera is full (%s of %s viewers). Close other camera viewers (Lychee, the "
@@ -788,6 +822,10 @@ class Recorder:
         self.parts.append(path)
         self.save_state()
         self.next_stream_try = time.monotonic() + 10
+        if self.alerted_full:
+            self.alerted_full = False
+            notify(self.cfg, "Recording started", f"{self.print_name}: a camera slot freed up, recording now.",
+                   tags="white_check_mark,camera")
 
     def stop_segment(self) -> None:
         if self.segment:
@@ -807,6 +845,7 @@ class Recorder:
         self.base = self.out_dir / f"{stamp}_{safe_name(st['filename'])}.mp4"
         self.session = dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + os.urandom(3).hex()
         self.task_id, self.parts, self.end_deadline = st["task_id"], [], None
+        self.print_name, self.alerted_full = safe_name(st["filename"]), False
         log.info("print started: %s (layer %s of %s)", st["filename"], st["layer"], st["total_layers"])
         self.next_stream_try = 0.0
         self.start_segment()
@@ -817,18 +856,29 @@ class Recorder:
         self.close_stream()
         parts, base = list(self.parts), self.base
         self.task_id, self.parts, self.base, self.end_deadline = "", [], None, None
+        if base and not parts:
+            notify(self.cfg, "Print was NOT recorded",
+                   f"{self.print_name}: the camera stayed full for the whole print. Restart the printer "
+                   "before the next one to clear stuck camera viewers.", priority="high", tags="x,camera")
         if base:
             self.finalize_later(parts, base)
+        self.alerted_full = False
 
     def finalize_later(self, parts: List[Path], base: Path) -> None:
         def job():
             try:
-                finalize(self.ffmpeg, parts, base, bool(self.cfg["keep_ts"]), self.cfg)
-            except Exception:
+                final = finalize(self.ffmpeg, parts, base, bool(self.cfg["keep_ts"]), self.cfg)
+            except Exception as e:
                 log.exception("could not finish %s; will retry in 10 minutes", base.name)
+                if self.retry_at is None:
+                    notify(self.cfg, "Video not saved yet", f"{base.name}: {e}. It is safe on the recorder "
+                           "and will be retried every 10 minutes.", priority="high", tags="warning")
                 self.retry_at = time.monotonic() + 600
                 return  # keep the state file so nothing is forgotten
             self.forget(base)
+            if final:
+                notify(self.cfg, "Print video saved",
+                       f"{final.name} ({final.stat().st_size / 1e9:.1f} GB) in {final.parent}", tags="movie_camera")
         self.finalizers = [t for t in self.finalizers if t.is_alive()]
         t = threading.Thread(target=job)
         t.start()
@@ -886,6 +936,30 @@ class Recorder:
         self.pidfile.unlink(missing_ok=True)
         self.finish_pending()
 
+    def check_idle_camera(self, now: float) -> None:
+        """Between prints, warn once if the camera is already full (stuck viewers)."""
+        if now < self.next_idle_check:
+            return
+        self.next_idle_check = now + 60 * float(self.cfg["idle_check_minutes"])
+        try:
+            a = self.printer.refresh_attributes()
+        except (OSError, SDCPError, WebSocketClosed):
+            return
+        used, cap = a.get("NumberOfVideoStreamConnected"), a.get("MaximumVideoStreamAllowed")
+        if not (isinstance(used, int) and isinstance(cap, int)):
+            return
+        if used >= cap and not self.idle_full_alerted:
+            self.idle_full_alerted = True
+            log.warning("camera is full (%s of %s) while no print is running", used, cap)
+            notify(self.cfg, "Next print won't be recorded",
+                   f"The printer camera is full ({used} of {cap} viewers) with no print running. Close "
+                   "Lychee's camera and the Elegoo app camera; if it stays full, restart the printer "
+                   "before your next print.", priority="high", tags="warning,camera")
+        elif used < cap and self.idle_full_alerted:
+            self.idle_full_alerted = False
+            notify(self.cfg, "Camera is free again", f"{used} of {cap} viewers in use. Ready to record.",
+                   tags="white_check_mark")
+
     def step(self) -> None:
         st = self.poll()
         now = time.monotonic()
@@ -911,6 +985,8 @@ class Recorder:
             self.end_deadline = now + float(self.cfg["stop_delay_seconds"])
 
         if self.base is None:
+            if st is not None and not st["printing"]:
+                self.check_idle_camera(now)
             return
         if self.end_deadline is not None and now >= self.end_deadline:
             self.end("stop delay over")
@@ -1134,6 +1210,7 @@ def main(argv=None) -> None:
     sub.add_parser("check", help="check the camera feed")
     sub.add_parser("status", help="show print status and camera viewers (read-only)")
     sub.add_parser("discover", help="list printers on this network")
+    sub.add_parser("notify-test", help="send a test alert to your phone")
     sub.add_parser("version")
     args = ap.parse_args(argv)
     cmd = args.cmd or "run"
@@ -1142,6 +1219,14 @@ def main(argv=None) -> None:
 
     if cmd == "version":
         print(VERSION)
+        return
+    if cmd == "notify-test":
+        if not cfg.get("notify_url"):
+            raise SystemExit("No notify_url in the settings.")
+        notify(cfg, "Test from the print recorder", "Alerts work. You'll hear from me if a print can't be recorded.",
+               tags="tada")
+        time.sleep(5)
+        print("sent")
         return
     if cmd != "run":
         {"setup": cmd_setup, "check": cmd_check, "status": cmd_status, "discover": cmd_discover}[cmd](cfg, args)
