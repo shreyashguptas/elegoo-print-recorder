@@ -38,7 +38,7 @@ It runs as a systemd service: it starts at boot and restarts if it crashes. If t
 
 | When | What happens |
 |---|---|
-| A print starts | Recording starts at layer 3 |
+| A print starts | Recording starts right away |
 | The print ends | 2 minutes later it saves `2026-10-16_14-11_My_Part.mp4` |
 | Your Mac restarts | It starts again by itself |
 
@@ -47,6 +47,7 @@ It runs as a systemd service: it starts at boot and restarts if it crashes. If t
 - **The camera only sends video while a print is running.** Run `make check` during a print to see the feed working.
 - **The printer allows 2 camera viewers** (Lychee, the Elegoo app, this recorder). If both are taken, close one.
 - **Camera stuck as "full"?** The printer never frees a viewer that crashed. Turn the printer off and on while it's idle.
+- **Phone alerts:** put `"notify_url": "https://ntfy.sh/<a-random-topic>"` in the settings and subscribe to that topic in the free [ntfy](https://ntfy.sh) app. You get a ping if a print can't be recorded, if the camera is full between prints, and when each video is saved.
 - **After `brew upgrade ffmpeg`, run `make install` again**, or recording stops.
 - Keep the Mac awake and on the same network. If it restarts mid-print, you get two videos.
 
