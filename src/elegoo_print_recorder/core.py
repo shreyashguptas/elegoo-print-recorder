@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 APP = "elegoo-print-recorder"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 IS_MAC = sys.platform == "darwin"
 if IS_MAC:
     # The macOS service is a system LaunchDaemon (macOS exempts those from Local
@@ -695,21 +695,46 @@ class TimelapseSync:
     and it plays; otherwise it is tried again on the next sync.
     """
 
+    MANIFEST = ".copied-timelapses.csv"   # kept on the NAS: a second record of what was copied
+
     def __init__(self, rec: "Recorder"):
         self.rec = rec
         self.statefile = rec.work / "timelapses.json"
+        self.startsfile = rec.work / "print-starts.json"
         self.started = time.time()
 
-    def load(self) -> Dict:
+    def note_start(self, task_id: str) -> None:
+        """Remember when a print really started (the printer's clock resets when it restarts)."""
+        starts = self._read(self.startsfile)
+        if task_id and task_id not in starts:
+            starts[task_id] = dt.datetime.now().isoformat(timespec="minutes")
+            self._write(self.startsfile, starts)
+
+    @staticmethod
+    def _read(path: Path) -> Dict:
         try:
-            return json.loads(self.statefile.read_text())
+            return json.loads(path.read_text())
         except (OSError, ValueError):
             return {}
 
+    @staticmethod
+    def _write(path: Path, data: Dict) -> None:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1))
+        os.replace(tmp, path)
+
+    def manifest_ids(self) -> set:
+        try:
+            with open(Path(self.rec.cfg["output_dir"]) / self.MANIFEST) as f:
+                return {line.split(",", 1)[0] for line in f if line.strip()}
+        except OSError:
+            return set()
+
+    def load(self) -> Dict:
+        return self._read(self.statefile)
+
     def save(self, done: Dict) -> None:
-        tmp = self.statefile.with_suffix(".tmp")
-        tmp.write_text(json.dumps(done, indent=1))
-        os.replace(tmp, self.statefile)
+        self._write(self.statefile, done)
 
     def history(self) -> List[Dict]:
         p = self.rec.printer
@@ -723,6 +748,7 @@ class TimelapseSync:
         """Real start time of each print. The printer only knows seconds since boot, so
         this works for prints since its last restart (newest entries until the clock jumps)."""
         when: Dict[str, Optional[dt.datetime]] = {}
+        seen = self._read(self.startsfile)
         up = self.rec.printer.uptime
         same_boot, prev = up is not None, None
         for t in items:
@@ -730,7 +756,10 @@ class TimelapseSync:
             if prev is not None and b > prev:
                 same_boot = False
             prev = b
-            if same_boot and up and b <= up[0] + (time.time() - up[1]):
+            tid = t.get("TaskId", "")
+            if tid in seen:
+                when[tid] = dt.datetime.fromisoformat(seen[tid])
+            elif same_boot and up and b <= up[0] + (time.time() - up[1]):
                 when[t.get("TaskId", "")] = dt.datetime.fromtimestamp(up[1] - (up[0] - b))
             else:
                 when[t.get("TaskId", "")] = None
@@ -742,10 +771,15 @@ class TimelapseSync:
         items = self.history()
         when = self.wall_clock(items)
         done = self.load()
+        on_nas = self.manifest_ids()          # survives losing the Dell's own records
         pending = False
         for t in items:
             tid = t.get("TaskId")
             if not tid or tid in done:
+                continue
+            if tid in on_nas:
+                done[tid] = {"status": "saved", "print": "(found in the NAS record)"}
+                self.save(done)
                 continue
             status, url = t.get("TimeLapseVideoStatus"), t.get("TimeLapseVideoUrl") or ""
             name = safe_name(Path(t.get("TaskName") or "print").name)
@@ -764,7 +798,7 @@ class TimelapseSync:
             start = when.get(tid)
             stamp = start.strftime("%Y-%m-%d_%H-%M") if start else f"undated_{tid[:8]}"
             target = Path(cfg["output_dir"]) / f"{stamp}_{name}_timelapse.mp4"
-            final = self.copy(url, target)
+            final = self.copy(url, target, tid)
             if final:
                 done[tid] = {"status": "saved", "file": final.name, "print": name}
                 self.save(done)
@@ -774,27 +808,67 @@ class TimelapseSync:
                            tags="movie_camera")
         return pending
 
-    def copy(self, url: str, target: Path) -> Optional[Path]:
-        import urllib.request
+    def copy(self, url: str, target: Path, task_id: str = "") -> Optional[Path]:
+        """Download, check, move to the recordings folder, then read it back from there and
+        compare checksums. Only a copy that matches byte for byte counts."""
+        import hashlib
         import urllib.parse
+        import urllib.request
         base = self.rec.cfg.get("files_url") or f"http://{self.rec.printer.ip}:{self.rec.cfg['ws_port']}"
         src = base.rstrip("/") + urllib.parse.quote(url)
         tmp = self.rec.work / (target.stem + ".download.mp4")
+        final = None
         try:
+            digest = hashlib.sha256()
             with urllib.request.urlopen(src, timeout=60) as r, open(tmp, "wb") as f:
                 expected = int(r.headers.get("Content-Length") or -1)
-                shutil.copyfileobj(r, f, 1 << 20)
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    digest.update(chunk)
+                    f.write(chunk)
             size = tmp.stat().st_size
             if size == 0 or (expected >= 0 and size != expected):
                 raise OSError(f"download incomplete ({size} of {expected} bytes)")
             if not file_video_info(self.rec.ffmpeg, tmp):
                 raise OSError("downloaded file is not a playable video")
+            out = Path(self.rec.cfg["output_dir"])
+            check_destination(out)
             make_output_dir(self.rec.cfg)
-            return move_into(tmp, target, self.rec.cfg)
+            final = move_into(tmp, target, self.rec.cfg)
+            if sha256_of(final) != digest.hexdigest():
+                raise OSError(f"copy on {out} does not match the printer's file")
+            with open(out / self.MANIFEST, "a") as m:
+                m.write(f"{task_id},{final.name},{size},{digest.hexdigest()},"
+                        f"{dt.datetime.now().isoformat(timespec='seconds')}\n")
+            return final
         except Exception as e:
             log.warning("could not copy timelapse %s: %s (will retry)", url, e)
             tmp.unlink(missing_ok=True)
+            if final is not None:
+                final.unlink(missing_ok=True)   # a bad copy must not look like a good one
             return None
+
+
+def sha256_of(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_destination(out: Path) -> None:
+    """Refuse to save into a NAS folder that is not mounted (it would silently land on the
+    local disk instead). A folder under /mnt, /media or /Volumes must be on another disk."""
+    if not str(out).startswith(("/mnt/", "/media/", "/Volumes/")):
+        return
+    p = out
+    while not p.exists():
+        if p.parent == p:
+            break
+        p = p.parent
+    if os.stat(p).st_dev == os.stat("/").st_dev:
+        raise OSError(f"{p} is not mounted (is the NAS offline?)")
 
 
 # --------------------------------------------------------------------------- recorder
@@ -1064,6 +1138,8 @@ class Recorder:
         self.finish_pending()
 
     def step_timelapse(self, st: Dict, now: float) -> None:
+        if st["printing"] and st["task_id"]:
+            self.timelapses.note_start(st["task_id"])
         if self.was_printing and not st["printing"]:
             log.info("print ended; watching for its timelapse")
             self.tl_watch_until = now + 20 * 60

@@ -386,3 +386,126 @@ def test_broken_download_is_retried_not_saved(tl, tmp_path):
     fake.files[fake.history[0]["TimeLapseVideoUrl"]] = _small_mp4(tmp_path)
     rec.next_tl_sync = 0
     assert wait_for(lambda: out.exists() and len(list(out.glob("*_Bad_timelapse.mp4"))) == 1, 15)
+
+
+# ---------------------------------------------------------------- failure drills
+
+def _new_rec(fake, tmp_path, **kw):
+    cfg = dict(core.DEFAULTS, printer_ip="127.0.0.1", ws_port=fake.port, output_dir=str(tmp_path / "nas"),
+               poll_seconds=0.3, ffmpeg=FFMPEG or "", work_dir=str(tmp_path / "work"), mode="timelapse",
+               files_url=fake.files_url)
+    cfg.update(kw)
+    rec = core.Recorder(cfg)
+    t = threading.Thread(target=rec.run, daemon=True)
+    t.start()
+    return rec, t
+
+
+def _stop(rec, t):
+    rec.stop_event.set()
+    t.join(30)
+
+
+def _mp4s(tmp_path):
+    d = tmp_path / "nas"
+    return sorted(p.name for p in d.glob("*.mp4")) if d.exists() else []
+
+
+@needs_ffmpeg
+def test_nas_offline_then_back(tmp_path, monkeypatch):
+    fake = FakePrinter(FFMPEG)
+    fake.add_history("Part.goo", "t1", 1, _small_mp4(tmp_path), ago=60)
+    real = core.check_destination
+    nas_up = {"v": False}
+
+    def check(out):
+        if not nas_up["v"]:
+            raise OSError("NAS offline")
+        real(out)
+
+    monkeypatch.setattr(core, "check_destination", check)
+    rec, t = _new_rec(fake, tmp_path)
+    time.sleep(2)
+    assert _mp4s(tmp_path) == [] and "t1" not in rec.timelapses.load()     # waits, nothing lost
+    nas_up["v"] = True
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 1, 15)
+    _stop(rec, t); fake.close()
+
+
+@needs_ffmpeg
+def test_dell_restart_and_lost_records_never_duplicate_or_resurrect(tmp_path):
+    fake = FakePrinter(FFMPEG)
+    clip = _small_mp4(tmp_path)
+    fake.add_history("A.goo", "t1", 1, clip, ago=600)
+    rec, t = _new_rec(fake, tmp_path)
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 1, 15)
+    _stop(rec, t)                                       # Dell restarts...
+    fake.add_history("B.goo", "t2", 1, clip, ago=60)    # ...and a print finished meanwhile
+    rec, t = _new_rec(fake, tmp_path)
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 2, 15)
+    _stop(rec, t)
+    # You delete one video from the NAS, and the Dell also loses its own records.
+    (tmp_path / "nas" / [n for n in _mp4s(tmp_path) if "_A_" in n][0]).unlink()
+    (tmp_path / "work" / "timelapses.json").unlink()
+    rec, t = _new_rec(fake, tmp_path)
+    time.sleep(3)
+    assert len(_mp4s(tmp_path)) == 1 and "_B_" in _mp4s(tmp_path)[0]       # deleted one stays deleted
+    _stop(rec, t); fake.close()
+
+
+@needs_ffmpeg
+def test_printer_restart_keeps_real_dates(tmp_path):
+    fake = FakePrinter(FFMPEG)
+    rec, t = _new_rec(fake, tmp_path)
+    fake.start_print("Dated.goo", "t9")
+    fake.layer = 40
+    time.sleep(1.5)                                     # the Dell notes the real start time
+    _stop(rec, t)
+    fake.finish_print()
+    fake.booted = time.time() + 999999                  # printer restarts: its clock starts over
+    fake.add_history("Dated.goo", "t9", 1, _small_mp4(tmp_path), ago=0)
+    rec, t = _new_rec(fake, tmp_path)
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 1, 15)
+    assert _mp4s(tmp_path)[0].startswith(dt_today())    # not "undated"
+    _stop(rec, t); fake.close()
+
+
+def dt_today():
+    import datetime
+    return datetime.date.today().isoformat()
+
+
+@needs_ffmpeg
+def test_bad_copy_on_nas_is_removed_and_redone(tmp_path, monkeypatch):
+    fake = FakePrinter(FFMPEG)
+    fake.add_history("C.goo", "t3", 1, _small_mp4(tmp_path), ago=60)
+    real = core.sha256_of
+    calls = {"n": 0}
+
+    def flaky(path):
+        calls["n"] += 1
+        return "corrupt" if calls["n"] == 1 else real(path)
+
+    monkeypatch.setattr(core, "sha256_of", flaky)
+    rec, t = _new_rec(fake, tmp_path)
+    time.sleep(2)
+    assert _mp4s(tmp_path) == []                        # the bad copy was deleted, not kept
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 1, 15)
+    lines = (tmp_path / "nas" / ".copied-timelapses.csv").read_text().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("t3,")
+    _stop(rec, t); fake.close()
+
+
+@needs_ffmpeg
+def test_printer_offline_then_back(tmp_path):
+    fake = FakePrinter(FFMPEG)
+    fake.add_history("D.goo", "t4", 1, _small_mp4(tmp_path), ago=60)
+    rec, t = _new_rec(fake, tmp_path, ws_port=1)        # printer unreachable
+    time.sleep(2)
+    assert _mp4s(tmp_path) == []
+    rec.printer.port = rec.cfg["ws_port"] = fake.port   # printer back
+    rec.next_tl_sync = 0
+    assert wait_for(lambda: len(_mp4s(tmp_path)) == 1, 20)
+    _stop(rec, t); fake.close()
