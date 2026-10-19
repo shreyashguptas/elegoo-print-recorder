@@ -7,7 +7,9 @@ APP="elegoo-print-recorder"
 PREFIX="/opt/$APP"                     # root-owned app; the service itself runs as $RUN_AS
 UNIT="/etc/systemd/system/$APP.service"
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
-trap 'echo "  ✗ install failed at scripts/install-linux.sh line $LINENO: $BASH_COMMAND"' ERR
+STOPPED=no
+# On any failure: say where, and never leave the recorder stopped.
+trap 'echo "  ✗ install failed at scripts/install-linux.sh line $LINENO: $BASH_COMMAND"; [ "$STOPPED" = yes ] && systemctl start "$APP" 2>/dev/null && echo "  (recorder started again with the previous setup)"' ERR
 
 # 1. Build the new app next to the old one; the running service is untouched until this works.
 export UV_PYTHON_INSTALL_DIR="$PREFIX/python" UV_CACHE_DIR="$PREFIX/cache" UV_NO_CONFIG=1
@@ -20,6 +22,7 @@ rm -rf "$PREFIX/cache"
 
 # 2. Swap it in. Stopping the old service lets it finish any recording cleanly.
 systemctl stop "$APP" 2>/dev/null || true
+STOPPED=yes
 rm -rf "$PREFIX/venv.old"
 if [ -d "$PREFIX/venv" ]; then mv "$PREFIX/venv" "$PREFIX/venv.old"; fi
 mv "$PREFIX/venv.new" "$PREFIX/venv"
@@ -27,7 +30,7 @@ rm -rf "$PREFIX/venv.old"
 chown -R root:root "$PREFIX"; chmod -R go-w "$PREFIX"
 
 install -d -m 0755 "/etc/$APP"
-install -m 0644 "$CONFIG" "/etc/$APP/config.json"
+[ "$CONFIG" -ef "/etc/$APP/config.json" ] || install -m 0644 "$CONFIG" "/etc/$APP/config.json"
 # No hard dependency on the recordings folder's disk (e.g. a NAS mount): at boot the
 # network may not be up yet, and systemd would then skip the service entirely.
 # The recorder records to local disk and retries the copy until the NAS is back.

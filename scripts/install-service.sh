@@ -10,7 +10,9 @@ SUPPORT="/Library/Application Support/elegoo-print-recorder"
 LOGS="/Library/Logs/elegoo-print-recorder"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
-trap 'echo "  ✗ install failed at scripts/install-service.sh line $LINENO: $BASH_COMMAND"' ERR
+STOPPED=no
+# On any failure: say where, and never leave the recorder stopped.
+trap 'echo "  ✗ install failed at scripts/install-service.sh line $LINENO: $BASH_COMMAND"; [ "$STOPPED" = yes ] && [ -f "$PLIST" ] && launchctl bootstrap system "$PLIST" 2>/dev/null && echo "  (recorder started again with the previous setup)"' ERR
 
 # 1. Build the new app next to the old one; the running service is untouched until this works.
 export UV_PYTHON_INSTALL_DIR="$PREFIX/python" UV_CACHE_DIR="$PREFIX/cache" UV_NO_CONFIG=1
@@ -23,6 +25,7 @@ rm -rf "$PREFIX/cache"
 
 # 2. Swap it in. Stopping the old service lets it finish any recording cleanly.
 launchctl bootout "system/$LABEL" 2>/dev/null || true
+STOPPED=yes
 rm -rf "$PREFIX/venv.old"
 if [ -d "$PREFIX/venv" ]; then mv "$PREFIX/venv" "$PREFIX/venv.old"; fi
 mv "$PREFIX/venv.new" "$PREFIX/venv"
@@ -30,7 +33,7 @@ rm -rf "$PREFIX/venv.old"
 chown -R root:wheel "$PREFIX"; chmod -R go-w "$PREFIX"
 
 mkdir -p "$SUPPORT" "$LOGS"
-install -m 0644 "$CONFIG" "$SUPPORT/config.json"
+[ "$CONFIG" -ef "$SUPPORT/config.json" ] || install -m 0644 "$CONFIG" "$SUPPORT/config.json"
 
 # 3. The camera sends video over UDP; let the service's programs through the firewall.
 FFMPEG=$("$PREFIX/venv/bin/python" -c 'import json,sys;print(json.load(open(sys.argv[1]))["ffmpeg"])' "$CONFIG")
